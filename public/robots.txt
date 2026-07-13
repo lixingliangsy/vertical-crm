@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://vertical-crm.com/sitemap.xml
