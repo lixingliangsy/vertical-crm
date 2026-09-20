@@ -1,0 +1,14 @@
+.vercel
+
+# AI usage quota counters (local)
+.data/
+
+# Superpowers audit 2026-07-18: ensure secrets/local artifacts ignored
+node_modules
+.next
+.env
+.env.local
+.env*.local
+data/*.json
+!.gitkeep
+dev-local*.log

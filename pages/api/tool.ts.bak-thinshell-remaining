@@ -1,0 +1,112 @@
+import type { NextApiRequest, NextApiResponse } from 'next'
+import { PRODUCT } from '../../lib/product'
+import { AI_QUOTAS, checkAndConsumeQuota, defaultModel, resolvePlan } from '../../lib/aiGateway'
+import { getByokKey } from '../../lib/byokStore'
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  let inputs: Record<string, string> = {}
+  try {
+    const body = (req.body || {}) as {
+      inputs?: Record<string, string>
+      useMock?: boolean
+      useByok?: boolean
+      plan?: 'free' | 'pro' | 'enterprise'
+    }
+    inputs = body.inputs || {}
+    const useMock = !!body.useMock
+    const plan = resolvePlan(req)
+    const slug = String((PRODUCT as any).slug || 'product')
+
+    const wantByok = plan === 'enterprise'
+    const byokKey = wantByok ? getByokKey(slug) : null
+    const platformKey = process.env.OPENAI_API_KEY || ''
+    const apiKey = byokKey || platformKey
+    const hasKey = !!apiKey
+
+    const mockFn = typeof (PRODUCT as any).mock === 'function' ? (PRODUCT as any).mock : null
+    const fallback = (note?: string) => {
+      const base =
+        mockFn
+          ? String(mockFn(inputs))
+          : `${(PRODUCT as any).name || 'Product'} DEMO\n\n` +
+            Object.entries(inputs)
+              .map(([k, v]) => `${k}: ${v}`)
+              .join('\n') +
+            '\n\n---\nPreview result.'
+      return note ? base + '\n\n(' + note + ')' : base
+    }
+
+    if (useMock) {
+      return res.status(200).json({ result: fallback(), mock: true, demo: true })
+    }
+
+    if (!hasKey) {
+      return res.status(503).json({
+        error: 'AI is not configured. Add OPENAI_API_KEY or enable Demo mode.',
+        code: 'AI_NOT_CONFIGURED',
+        demo: false,
+        configured: false,
+        degraded: true,
+      })
+    }
+
+    const quota = checkAndConsumeQuota(slug, plan)
+    if (!quota.ok) {
+      return res.status(429).json({
+        error: 'Fair use limit reached. Upgrade or wait for reset.',
+        code: 'QUOTA_EXCEEDED',
+        demo: false,
+        quota: {
+          plan: quota.plan,
+          daily: quota.daily,
+          monthly: quota.monthly,
+          dailyLimit: quota.dailyLimit,
+          monthlyLimit: quota.monthlyLimit,
+        },
+      })
+    }
+
+    const inputText = PRODUCT.inputs
+      .map((f) => `${f.label}: ${inputs[f.key] || '(not provided)'}`)
+      .join('\n')
+
+    const base = process.env.OPENAI_BASE_URL || 'https://integrate.api.nvidia.com/v1'
+    const model = process.env.OPENAI_MODEL || defaultModel()
+
+    const r = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: PRODUCT.systemPrompt },
+          { role: 'user', content: inputText },
+        ],
+        temperature: 0.7,
+        max_tokens: quota.maxTokens || AI_QUOTAS[plan].maxTokens,
+      }),
+    })
+
+    if (!r.ok) {
+      const t = await r.text()
+      throw new Error('AI request failed: ' + t.slice(0, 160))
+    }
+    const data = await r.json()
+    const text = data.choices?.[0]?.message?.content || ''
+    if (!text.trim()) throw new Error('Empty AI response')
+    return res.status(200).json({ result: text, mock: false, demo: false, source: 'Model-assisted' })
+  } catch (e: any) {
+    return res.status(502).json({
+      error: 'AI service call failed: ' + (e?.message || 'unknown error'),
+      code: 'AI_UPSTREAM_FAILED',
+      degraded: true,
+      demo: false,
+      mock: false,
+    })
+  }
+}

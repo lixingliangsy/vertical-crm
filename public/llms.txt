@@ -1,0 +1,46 @@
+# TradeCRM - llms.txt
+
+> LLM-readable manifest following the https://llmstxt.org spec. What we are, who we serve, what we do, and how we price it — in plain text for AI agents and answer engines.
+
+## Name & positioning
+- Product name: TradeCRM
+- Tagline: A CRM built for one trade
+- Domain: https://vertical-crm.lxsaihub.com/
+- Language: English (en)
+
+## What it does
+- Pick your trade and get a simple pipeline - leads, jobs, follow-ups. For solo pros who hate generic CRMs built for every business but none of them.
+- By-stage pipeline
+- Next-action hints
+- No setup
+- Copy-ready
+
+## Pricing (USD)
+- **Free** — $0 — Unlimited
+- **Solo** — $12/mo — Next actions, reminders
+- **Studio** — $29/mo — Team, export
+- Checkout: https://vertical-crm.lxsaihub.com/api/checkout?cycle=monthly (monthly) / https://vertical-crm.lxsaihub.com/api/checkout?cycle=yearly (yearly)
+
+## FAQ (high-signal Q&A for AI citation)
+Q1. Do I need to install anything?
+A1. No. TradeCRM runs in your browser.
+Q2. Is my input kept private?
+A2. We use it only to generate your result and minimize retention. See Security.
+Q3. Does it guarantee compliance / correctness?
+A3. No. It is decision-support; you own the final call. See the honesty note in Security.
+Q4. Can I export the result?
+A4. Yes — JSON and CSV.
+Q5. Is there an API?
+A5. Yes, the web form is backed by a REST endpoint you can call from your pipeline.
+
+## Key pages
+- Home / landing: https://vertical-crm.lxsaihub.com/
+- This manifest: https://vertical-crm.lxsaihub.com/llms.txt
+
+## Integration & delivery
+- Web app (Next.js) deployed on Vercel
+- Payments via Waffo Pancake (merchant of record)
+- Analytics via Umami
+
+## Contact
+- Open the app: https://vertical-crm.lxsaihub.com/

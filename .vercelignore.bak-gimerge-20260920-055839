@@ -1,0 +1,7 @@
+# 2026-09-20: never publish backup snapshots.
+# Verified with fnmatch against 100 real stray filenames.
+*.bak*
+_bak*
+_snapshots*/**
+_trash*/**
+__pycache__*/**

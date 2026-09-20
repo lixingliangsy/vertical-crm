@@ -1,0 +1,13 @@
+﻿RULESET_VERSION: crm@2026-07-22
+  PASS: RULESET_VERSION is date-stamped
+  PASS: ruleset has >=5 rules (CRM-001..005)
+  PASS: CRM-001 passes when leads grouped into stages
+  PASS: CRM-001 fails on empty leads
+  PASS: CRM-002 fails on unknown stage "banana"
+  PASS: CRM-002 passes on canonical stage
+  PASS: CRM-003 fails when no next action
+  PASS: CRM-003 passes when only closed stage present
+  PASS: CRM-005 honesty guard passes
+  PASS: canonical stages include won
+
+ALL SELF-TESTS PASSED

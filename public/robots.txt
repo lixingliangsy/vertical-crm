@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+
+# LLM / AI answer-engine indexing
+LLM-Content: https://vertical-crm.lxsaihub.com/llms.txt
+
+Sitemap: https://vertical-crm.lxsaihub.com/sitemap.xml

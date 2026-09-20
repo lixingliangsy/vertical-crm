@@ -1,0 +1,47 @@
+// tsx self-test for the vertical-crm deterministic rules engine.
+// Run: tsx lib/rules/__selftest.ts
+import { CRM_RULES, runAllRules, RULESET_VERSION, CANONICAL_STAGES } from './crm'
+
+let failed = 0
+function assert(cond: boolean, msg: string) {
+  if (cond) {
+    console.log('  PASS:', msg)
+  } else {
+    failed++
+    console.error('  FAIL:', msg)
+  }
+}
+
+console.log('RULESET_VERSION:', RULESET_VERSION)
+assert(/^crm@\d{4}-\d{2}-\d{2}$/.test(RULESET_VERSION), 'RULESET_VERSION is date-stamped')
+assert(CRM_RULES.length >= 5, 'ruleset has >=5 rules (CRM-001..005)')
+
+// CRM-001: leads parse into named stages
+const r1 = runAllRules({ leads: 'Acme - lead\nSmith - won', stages: ['lead', 'won'], hasNextAction: true, storesPII: false })
+assert(r1.find((r) => r.id === 'CRM-001')!.passed, 'CRM-001 passes when leads grouped into stages')
+
+const r1b = runAllRules({ leads: '', stages: [], hasNextAction: false, storesPII: false })
+assert(!r1b.find((r) => r.id === 'CRM-001')!.passed, 'CRM-001 fails on empty leads')
+
+// CRM-002: coherent vocabulary
+const r2 = runAllRules({ leads: 'A - lead', stages: ['banana'], hasNextAction: true, storesPII: false })
+assert(!r2.find((r) => r.id === 'CRM-002')!.passed, 'CRM-002 fails on unknown stage "banana"')
+
+const r2b = runAllRules({ leads: 'A - lead', stages: ['lead'], hasNextAction: true, storesPII: false })
+assert(r2b.find((r) => r.id === 'CRM-002')!.passed, 'CRM-002 passes on canonical stage')
+
+// CRM-003: earliest-stage leads need next action
+const r3 = runAllRules({ leads: 'A - lead', stages: ['lead'], hasNextAction: false, storesPII: false })
+assert(!r3.find((r) => r.id === 'CRM-003')!.passed, 'CRM-003 fails when no next action')
+
+const r3b = runAllRules({ leads: 'A - won', stages: ['won'], hasNextAction: false, storesPII: false })
+assert(r3b.find((r) => r.id === 'CRM-003')!.passed, 'CRM-003 passes when only closed stage present')
+
+// CRM-005 honesty guard always passes
+const r5 = runAllRules({ leads: 'A - lead', stages: ['lead'], hasNextAction: true, storesPII: true })
+assert(r5.find((r) => r.id === 'CRM-005')!.passed, 'CRM-005 honesty guard passes')
+
+assert(CANONICAL_STAGES.includes('won'), 'canonical stages include won')
+
+console.log(failed === 0 ? '\nALL SELF-TESTS PASSED' : `\n${failed} ASSERTION(S) FAILED`)
+if (failed > 0) process.exitCode = 1

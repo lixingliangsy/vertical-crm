@@ -1,0 +1,166 @@
+import type { NextApiRequest, NextApiResponse } from 'next'
+import { createRun, completeRun, STEP_LABELS } from '../../lib/pipeline'
+import type { RunState } from '../../lib/pipeline'
+import { saveRun } from '../../lib/runStore'
+import { PRODUCT } from '../../lib/product'
+import {AI_QUOTAS, checkAndConsumeQuota, defaultModel, resolvePlan, chatWithFallback} from '../../lib/aiGateway'
+import { getByokKey } from '../../lib/byokStore'
+import { appendAudit } from '../../lib/auditLog'
+import { RULESET_VERSION, runDeterministicChecks } from '../../lib/rules/crm'
+
+function withRules(base: string, hitsRaw: ReturnType<typeof runDeterministicChecks>) {
+  const hits: any[] = Array.isArray(hitsRaw)
+    ? hitsRaw
+    : Array.isArray((hitsRaw as any)?.hits)
+      ? (hitsRaw as any).hits
+      : []
+  const lines = [base.trim(), '', `=== Rule-based checks (${RULESET_VERSION}) ===`]
+  if (!hits.length) lines.push('(no rule hits)')
+  else {
+    for (const h of hits) {
+      lines.push(`- [${h.severity}] ${h.id} ${h.title}${h.passed ? ' | OK' : ' | FLAG'}`)
+      if (!h.passed && h.remediation) lines.push(`  remediation: ${h.remediation}`)
+    }
+  }
+  lines.push('---')
+  lines.push('Sources: Rule-based checklist + Model-assisted narrative. Decision-support only - not a guarantee.')
+  return lines.join('\n')
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  let inputs: Record<string, string> = {}
+  let runId = ''
+  let run: RunState | null = null
+  try {
+    const body = (req.body || {}) as {
+      inputs?: Record<string, string>
+      useMock?: boolean
+      useByok?: boolean
+      plan?: 'free' | 'pro' | 'enterprise'
+      action?: string
+    }
+    inputs = body.inputs || {}
+    const useMock = !!body.useMock
+    const plan = resolvePlan(req)
+    const slug = String((PRODUCT as any).slug || 'vertical-crm')
+    const wantByok = plan === 'enterprise'
+    const byokKey = wantByok ? getByokKey(slug) : null
+    const platformKey = process.env.OPENAI_API_KEY || ''
+    const apiKey = byokKey || platformKey
+    const hasKey = !!apiKey
+    const mockFn = typeof (PRODUCT as any).mock === 'function' ? (PRODUCT as any).mock : null
+    run = createRun(inputs)
+    run.rulesetVersion = RULESET_VERSION
+    saveRun(run)
+    runId = run.runId
+    const checks = runDeterministicChecks(inputs)
+    const stepLabel = STEP_LABELS[run.step]
+
+    if (useMock) {
+      const raw = mockFn ? String(mockFn(inputs)) : 'Demo preview'
+      const result = withRules(raw, checks)
+      const done = completeRun(run, { ruleHits: checks, modelText: raw, demo: true })
+      saveRun(done)
+      appendAudit(slug, {
+        ts: new Date().toISOString(),
+        runId,
+        step: done.step,
+        event: 'demo_complete',
+        detail: 'explicit useMock',
+        model: 'demo',
+      })
+      return res.status(200).json({
+        result,
+        demo: true,
+        mock: true,
+        runId,
+        step: done.step,
+        stepLabel: STEP_LABELS[done.step],
+        status: done.status,
+        rulesetVersion: RULESET_VERSION,
+        ruleHits: checks,
+      })
+    }
+
+    if (!hasKey) {
+      return res.status(503).json({
+        error: 'AI is not configured. Add OPENAI_API_KEY or enable Demo mode.',
+        code: 'AI_NOT_CONFIGURED',
+        demo: false,
+        runId,
+      })
+    }
+
+    const quota = checkAndConsumeQuota(slug, plan)
+    if (!quota.ok) {
+      return res.status(429).json({
+        error: 'Fair use limit reached. Upgrade or wait for reset.',
+        code: 'QUOTA_EXCEEDED',
+        demo: false,
+        runId,
+        quota: {
+          plan: quota.plan,
+          daily: quota.daily,
+          monthly: quota.monthly,
+          dailyLimit: quota.dailyLimit,
+          monthlyLimit: quota.monthlyLimit,
+        },
+      })
+    }
+
+    const model = process.env.OPENAI_MODEL || defaultModel()
+    const fields = Array.isArray((PRODUCT as any).inputs) ? (PRODUCT as any).inputs : []
+    const inputText = fields.length
+      ? fields.map((f: any) => `${f.label}: ${inputs[f.key] || '(not provided)'}`).join('\n')
+      : Object.entries(inputs).map(([k, v]) => `${k}: ${v || '(not provided)'}`).join('\n') || '(no inputs)'
+    const base = process.env.OPENAI_BASE_URL || 'https://integrate.api.nvidia.com/v1'
+    const text = await chatWithFallback(apiKey, base, [
+      { role: 'system', content: PRODUCT.systemPrompt },
+      { role: 'user', content: inputText },
+    ], { model, temperature: 0.7, maxTokens: quota.maxTokens || AI_QUOTAS[plan].maxTokens })
+    if (!text.trim()) throw new Error('Empty AI response')
+    const result = withRules(text, checks)
+    const done = completeRun(run, { ruleHits: checks, modelText: text })
+    saveRun(done)
+    appendAudit(slug, {
+      ts: new Date().toISOString(),
+      runId,
+      step: done.step,
+      event: 'complete',
+      model,
+    })
+    return res.status(200).json({
+      result,
+      demo: false,
+      mock: false,
+      source: 'Model-assisted',
+      runId,
+      step: done.step,
+      stepLabel: STEP_LABELS[done.step],
+      status: done.status,
+      model,
+      rulesetVersion: RULESET_VERSION,
+      ruleHits: checks,
+    })
+  } catch (e: any) {
+    try {
+      if (run) {
+        run.status = 'failed'
+        run.error = e?.message || 'unknown error'
+        saveRun(run)
+      }
+    } catch {
+      /* ignore */
+    }
+    return res.status(502).json({
+      error: 'AI service call failed: ' + (e?.message || 'unknown error'),
+      code: 'AI_UPSTREAM_FAILED',
+      degraded: true,
+      demo: false,
+      mock: false,
+      runId,
+    })
+  }
+}

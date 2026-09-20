@@ -1,0 +1,221 @@
+/**
+ * Platform-paid LLM with Fair Use quotas (cost control).
+ * - Default model: gpt-4o-mini (cheap)
+ * - Soft/hard monthly + daily caps per product slug
+ * - On exceed: caller should degrade to mock (ChatGPT-style)
+ *
+ * Trust boundary: plan is NEVER taken from client body/headers alone.
+ * Elevation only via AI_PLAN_OVERRIDE (server env) or signed x-ai-entitlement.
+ */
+import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
+
+export type AiPlan = 'free' | 'pro' | 'enterprise'
+
+export const AI_QUOTAS: Record<AiPlan, { daily: number; monthly: number; maxTokens: number }> = {
+  free: { daily: 10, monthly: 50, maxTokens: 600 },
+  pro: { daily: 40, monthly: 300, maxTokens: 1000 },
+  enterprise: { daily: 200, monthly: 3000, maxTokens: 1500 },
+}
+
+type UsageFile = {
+  monthKey: string
+  dayKey: string
+  monthly: number
+  daily: number
+}
+
+function usagePath(slug: string): string {
+  const dir = path.join(process.cwd(), '.data')
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+  return path.join(dir, `ai-usage-${slug}.json`)
+}
+
+function keys() {
+  const now = new Date()
+  const monthKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`
+  const dayKey = `${monthKey}-${String(now.getUTCDate()).padStart(2, '0')}`
+  return { monthKey, dayKey }
+}
+
+function load(slug: string): UsageFile {
+  const { monthKey, dayKey } = keys()
+  const p = usagePath(slug)
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as UsageFile
+    if (raw.monthKey !== monthKey) return { monthKey, dayKey, monthly: 0, daily: 0 }
+    if (raw.dayKey !== dayKey) return { monthKey, dayKey, monthly: raw.monthly, daily: 0 }
+    return raw
+  } catch {
+    return { monthKey, dayKey, monthly: 0, daily: 0 }
+  }
+}
+
+function save(slug: string, u: UsageFile) {
+  fs.writeFileSync(usagePath(slug), JSON.stringify(u), 'utf8')
+}
+
+function parsePlan(raw: string): AiPlan | null {
+  const v = raw.toLowerCase().trim()
+  if (v === 'free' || v === 'pro' || v === 'enterprise') return v
+  return null
+}
+
+/**
+ * Optional signed entitlement: header `x-ai-entitlement` = `plan:expMs:hexHmac`
+ * HMAC-SHA256(secret, `${plan}:${expMs}`) where secret = AI_ENTITLEMENT_SECRET.
+ * Client cannot forge without the server secret.
+ */
+function verifySignedEntitlement(
+  req?: { headers?: Record<string, string | string[] | undefined> }
+): AiPlan | null {
+  const secret = process.env.AI_ENTITLEMENT_SECRET
+  if (!secret || !req?.headers) return null
+  const h = req.headers
+  const rawVal = h['x-ai-entitlement'] ?? h['X-Ai-Entitlement']
+  const raw = String(Array.isArray(rawVal) ? rawVal[0] : rawVal || '')
+  const parts = raw.split(':')
+  if (parts.length !== 3) return null
+  const [planRaw, expStr, sig] = parts
+  const plan = parsePlan(planRaw)
+  if (!plan) return null
+  const exp = Number(expStr)
+  if (!Number.isFinite(exp) || Date.now() > exp) return null
+  const payload = `${plan}:${expStr}`
+  const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex')
+  try {
+    const a = Buffer.from(expected, 'utf8')
+    const b = Buffer.from(String(sig), 'utf8')
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null
+  } catch {
+    return null
+  }
+  return plan
+}
+
+/**
+ * Resolve Fair Use plan from server-trusted sources only.
+ * - Does NOT read body.plan
+ * - Does NOT trust bare x-ai-plan (client-spoofable)
+ * - Default: free (conservative until session/billing exists)
+ */
+export function resolvePlan(req?: { headers?: Record<string, string | string[] | undefined> }): AiPlan {
+  const envPlan = parsePlan(String(process.env.AI_PLAN_OVERRIDE || ''))
+  if (envPlan) return envPlan
+  const signed = verifySignedEntitlement(req)
+  if (signed) return signed
+  return 'free'
+}
+
+export type QuotaCheck = {
+  ok: boolean
+  plan: AiPlan
+  daily: number
+  monthly: number
+  dailyLimit: number
+  monthlyLimit: number
+  maxTokens: number
+  reason?: string
+}
+
+/** Returns ok=false when fair-use quota exceeded (degrade to mock). */
+export function checkAndConsumeQuota(slug: string, plan: AiPlan = 'free'): QuotaCheck {
+  const q = AI_QUOTAS[plan] || AI_QUOTAS.free
+  const u = load(slug)
+  if (u.daily >= q.daily) {
+    return {
+      ok: false,
+      plan,
+      daily: u.daily,
+      monthly: u.monthly,
+      dailyLimit: q.daily,
+      monthlyLimit: q.monthly,
+      maxTokens: q.maxTokens,
+      reason: 'daily_fair_use_exceeded',
+    }
+  }
+  if (u.monthly >= q.monthly) {
+    return {
+      ok: false,
+      plan,
+      daily: u.daily,
+      monthly: u.monthly,
+      dailyLimit: q.daily,
+      monthlyLimit: q.monthly,
+      maxTokens: q.maxTokens,
+      reason: 'monthly_fair_use_exceeded',
+    }
+  }
+  u.daily += 1
+  u.monthly += 1
+  save(slug, u)
+  return {
+    ok: true,
+    plan,
+    daily: u.daily,
+    monthly: u.monthly,
+    dailyLimit: q.daily,
+    monthlyLimit: q.monthly,
+    maxTokens: q.maxTokens,
+  }
+}
+
+export function defaultModel(): string {
+  return process.env.OPENAI_MODEL || 'gpt-4o-mini'
+}
+
+
+// ---- model fallback (P0, 2026-09-18) ----
+// Primary model (OPENAI_MODEL) with automatic fail-over to BACKUP_MODEL on
+// 5xx / 429 / network error / empty completion. 4xx (bad request / auth) fails fast.
+export const BACKUP_MODEL = process.env.OPENAI_MODEL_FALLBACK || 'nemotron-3.5-lightning-30b-a3b'
+
+export async function chatWithFallback(
+  apiKey: string,
+  base: string,
+  messages: { role: string; content: string }[],
+  opts: { model?: string; temperature?: number; maxTokens?: number; backupModel?: string } = {},
+): Promise<string> {
+  const primary = opts.model || defaultModel()
+  const backup = opts.backupModel || BACKUP_MODEL
+  const order = Array.from(new Set([primary, backup].filter(Boolean)))
+  let lastErr = 'unknown'
+  for (let i = 0; i < order.length; i++) {
+    const m = order[i]
+    try {
+      const r = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: m,
+          messages,
+          temperature: opts.temperature ?? 0.7,
+          max_tokens: opts.maxTokens ?? 1000,
+        }),
+      })
+      if (!r.ok) {
+        const t = await r.text().catch(() => '')
+        if (r.status >= 500 || r.status === 429) {
+          lastErr = `model ${m} HTTP ${r.status}`
+          if (i < order.length - 1) continue
+          throw new Error('AI request failed: ' + lastErr.slice(0, 160))
+        }
+        throw new Error('AI request failed: ' + t.slice(0, 160))
+      }
+      const data = await r.json()
+      const text = data?.choices?.[0]?.message?.content || ''
+      if (!text.trim()) {
+        lastErr = `model ${m} empty response`
+        if (i < order.length - 1) continue
+        throw new Error('Empty AI response')
+      }
+      return text
+    } catch (e: any) {
+      if (i >= order.length - 1) throw new Error('AI service call failed: ' + (e?.message || lastErr))
+      lastErr = e?.message || lastErr
+      continue
+    }
+  }
+  throw new Error('AI service call failed: ' + lastErr)
+}
